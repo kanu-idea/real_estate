@@ -1,23 +1,24 @@
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Request
+from fastapi.responses import JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
+from typing import List, Dict, Any
 import openai
 import os
 import json
 import re
+import csv
+import langfuse
+import logging
+import pandas as pd
 from langchain_community.chat_models import ChatOpenAI
 from langchain.prompts import ChatPromptTemplate
 from langchain.schema import HumanMessage, SystemMessage
-from langfuse import get_client, observe
-import logging
+from langfuse import get_client, observe, Langfuse
+
 
 from dotenv import load_dotenv
 load_dotenv()
-
-# Initialize Langfuse
-langfuse = get_client()
-prompt_obj = langfuse.get_prompt("real_estate_content_generation", label="production")
-prompt_template = prompt_obj.prompt  # or .content, depending on SDK version
 
 app = FastAPI()
 
@@ -33,6 +34,10 @@ class QuestionAnswer(BaseModel):
     question: str
     answer: str
 
+class Question(BaseModel):
+    question: str
+    answer: str
+    
 class QuestionSection(BaseModel):
     section: str
     questions: list[QuestionAnswer]
@@ -40,17 +45,29 @@ class QuestionSection(BaseModel):
 class ContentRequest(BaseModel):
     agent_answers: list[QuestionSection]
 
+class Section(BaseModel):
+    section: str
+    questions: List[Question]
+
+class EmailGenerator(BaseModel):
+    agent_answers: List[Section]
+
+EMAIL_CSV_PATH = r"C:\Users\tarun\OneDrive\Desktop\workspace\IDEAFOUNDATION\doc_understand\email_generate\emails.csv"
+OUTPUT_CSV_PATH = "personalized_emails.csv"
+
+# === Load DataFrame ===
+df = pd.read_csv(EMAIL_CSV_PATH, quoting=csv.QUOTE_ALL, engine='python', on_bad_lines='skip', dtype=str)
 
 # Initialize LangChain's OpenAI wrapper
 llm = ChatOpenAI(
     openai_api_key=os.getenv("OPENAI_API_KEY"),  # Use environment variable instead
-    model="gpt-3.5-turbo",
+    model="gpt-4o-mini",
     temperature=0.7,
     max_tokens=1500
 )
 
-@observe(name="build_prompt")
-def build_prompt(agent_answers):
+@observe(name="build_agent_prompt")
+def build_agent_prompt(agent_answers):
     """Build the complete prompt from agent answers"""
     prompt = prompt_template
     for section in agent_answers:
@@ -59,6 +76,32 @@ def build_prompt(agent_answers):
             prompt += f"- {qa.question}\n{qa.answer}\n"
     
     return prompt
+
+def build_prompt(original_html, stage, agent_context=None):
+    if agent_context is None:
+        agent_context = YOUR_DEFAULT_AGENT_CONTEXT  # fallback
+
+    # Fetch prompt template from Langfuse
+    prompt_obj = langfuse_client.get_prompt("personalize_email_prompt", label="production")
+    prompt_template = prompt_obj.prompt  # or .content, depending on SDK version
+
+    # Render the prompt with variables
+    return prompt_template.format(
+        original_html=original_html,
+        stage=stage,
+        agent_context=agent_context
+    )
+
+# Initialize Langfuse
+langfuse = get_client()
+prompt_obj = langfuse.get_prompt("real_estate_content_generation", label="production")
+prompt_template = prompt_obj.prompt  # or .content, depending on SDK version
+
+langfuse_client = Langfuse(
+    public_key=os.environ.get("LANGFUSE_PUBLIC_KEY"),
+    secret_key=os.environ.get("LANGFUSE_SECRET_KEY"),
+    host=os.environ.get("LANGFUSE_HOST", "https://cloud.langfuse.com")
+)
 
 @observe(name="clean_json")
 def clean_json(text):
@@ -84,10 +127,10 @@ def generate_content(request: ContentRequest):
     with langfuse.start_as_current_span(
         name="llm_generation",
         input={"request": request.dict()},
-        metadata={"model": "gpt-3.5-turbo"}
+        metadata={"model": "gpt-4o-mini"}
     ) as span:
         # Build the prompt
-        prompt = build_prompt(request.agent_answers)
+        prompt = build_agent_prompt(request.agent_answers)
         
         # Use LangChain to call the LLM
         messages = [
@@ -141,6 +184,85 @@ def generate_content(request: ContentRequest):
             "scores": scores
         }
 
+@app.post("/generate-email")
+async def post_agent_questionnaire(agent_questionnaire: EmailGenerator):
+    custom_agent_context = agent_questionnaire.dict()
+    personalized_emails = []
+
+    # Start a single Langfuse span for the batch (or do one per row if you prefer)
+    span = langfuse_client.start_span(
+        name="agent_questionnaire_batch",
+        input={"questionnaire": custom_agent_context}
+    )
+    try:
+        for idx, row in df.iterrows():
+            sample_html = row['Content']
+            stage = row.get('Stage', 'Custom')
+            prompt = build_prompt(sample_html, stage, agent_context=custom_agent_context)
+            try:
+                client = openai.OpenAI(api_key=os.environ.get("OPENAI_API_KEY"))
+                response = client.chat.completions.create(
+                    model="gpt-4o-mini",
+                    messages=[{"role": "user", "content": prompt}],
+                    temperature=0.1
+                )
+                output = response.choices[0].message.content.strip()
+                personalized_emails.append({
+                    "row": idx,
+                    "stage": stage,
+                    "personalized_email": output
+                })
+            except Exception as e:
+                personalized_emails.append({
+                    "row": idx,
+                    "stage": stage,
+                    "error": str(e)
+                })
+        span.update(output=personalized_emails)
+        output_df = df.copy()
+        output_df['Content'] = [email.get("personalized_email", email.get("error", "")) for email in personalized_emails]
+        output_df.to_csv(OUTPUT_CSV_PATH, index=False, quoting=csv.QUOTE_ALL)
+        return JSONResponse(content={"personalized_emails": personalized_emails})
+    except Exception as e:
+        span.update(output=str(e), level="ERROR")
+        raise
+    finally:
+        span.end()
+
+# === Call OpenAI ===
+def personalize_content(html, stage):
+    prompt = build_prompt(html, stage)
+    span = langfuse_client.start_span(name="personalize_email", input=prompt)
+    try:
+        client = openai.OpenAI(api_key=os.environ.get("OPENAI_API_KEY"))
+        response = client.chat.completions.create(
+            model="gpt-4o-mini",
+            messages=[{"role": "user", "content": prompt}],
+            temperature=0.1
+        )
+        output = response.choices[0].message.content.strip()
+        span.update(output=output)
+        return output
+    except Exception as e:
+        span.update(output=str(e), level="ERROR")
+        print(f"⚠️ LLM Error: {e}")
+        return html  # fallback to original
+    finally:
+        span.end()
+
+# === Apply Personalization ===
+def personalize_row(row):
+    try:
+        original_html = row.get('Content', '')
+        stage = row.get('Stage')  # Default to 'Unknown' if not present
+        if not isinstance(original_html, str) or not original_html.strip():
+            raise ValueError("Empty content")
+        personalized_html = personalize_content(original_html, stage)
+        return personalized_html
+    except Exception as e:
+        print(f"skipped row: {e}")
+        return row['Content']  # fallback to original content
+    
 def score_home_page(llm, content):
     return score_section_with_llm(llm, "home_page", content)
 
